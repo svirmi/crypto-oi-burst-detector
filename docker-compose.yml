@@ -1,0 +1,21 @@
+services:
+  redis:
+    image: redis
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  symbol-resolver:
+    build:
+      context: ./symbol-resolver
+    container_name: symbols    
+    environment:
+      - APP_ENV=prod
+    volumes:
+      - ./symbol-resolver:/app/symbol-resolver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis  
+
+      
