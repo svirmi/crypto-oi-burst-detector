@@ -1,17 +1,24 @@
-FROM golang:1.26.3-alpine AS golang
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
-COPY . .
+
+# The glob go.su[m] matches go.sum if it exists and silently skips it if it doesn't. 
+# When you eventually add a dependency, no Dockerfile change needed.
+COPY go.mod go.su[m] ./  
 
 RUN go mod download
 RUN go mod verify
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /symbol-resolver .
+COPY . .
 
-FROM gcr.io/distroless/static-debian11
+# main.go is at root, so build target is "."
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -o /symbol-resolver \
+    .
 
-COPY --from=golang /symbol-resolver .
+FROM gcr.io/distroless/static-debian11:nonroot
 
-# EXPOSE 8080
+COPY --from=builder /symbol-resolver /symbol-resolver
 
 CMD ["/symbol-resolver"]
