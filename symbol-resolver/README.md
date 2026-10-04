@@ -1,5 +1,8 @@
 Here is the complete, production-grade **Technical Specification** for the **`symbol-resolver`** microservice, formatted in Markdown for direct use by your Go development team.
 
+curl [http://localhost:8080/health](http://localhost:8080/health)
+curl [http://localhost:8080/api/v1/symbols/overlapping](http://localhost:8080/api/v1/symbols/overlapping)
+
 ***
 
 # Technical Specification: `symbol-resolver` Microservice

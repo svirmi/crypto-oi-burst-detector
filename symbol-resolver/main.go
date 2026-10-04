@@ -2,302 +2,178 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
+	"errors"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
-	"sync"
 	"syscall"
 	"time"
+
+	"symbol-resolver/internal/client"
+	"symbol-resolver/internal/model"
+	"symbol-resolver/internal/resolver"
+	"symbol-resolver/internal/server"
 )
 
 const (
-	bybitAPIEndpoint = "https://api.bybit.com/v5/market/instruments-info"
-	requestTimeout   = 10 * time.Second
-	serverPort       = "8080"
-	updateInterval   = 2 * time.Minute
+	httpAddr        = ":8080"
+	refreshInterval = 1 * time.Hour
+	retryInterval   = 5 * time.Minute
+	fetchTimeout    = 5 * time.Second
 )
 
-// Instrument represents a symbol from Bybit with all relevant fields
-type Instrument struct {
-	Symbol        string `json:"symbol"`
-	Status        string `json:"status"`
-	DisplayName   string `json:"displayName"`
-	SettleCoin    string `json:"settleCoin"`
-	BaseCoin      string `json:"baseCoin"`
-	QuoteCoin     string `json:"quoteCoin"`
-	LotSizeFilter struct {
-		MinOrderQty string `json:"minOrderQty"`
-	} `json:"lotSizeFilter"`
-}
+var retryBackoff = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
-// USDCUSDTPair represents a symbol pair with both USDC and USDT versions
-type USDCUSDTPair struct {
-	BaseSymbol string `json:"baseSymbol"`
-	USDC       struct {
-		Symbol      string `json:"symbol"`
-		DisplayName string `json:"displayName"`
-		MinOrderQty string `json:"minOrderQty"`
-	} `json:"usdc"`
-	USDT struct {
-		Symbol      string `json:"symbol"`
-		DisplayName string `json:"displayName"`
-		MinOrderQty string `json:"minOrderQty"`
-	} `json:"usdt"`
-}
-
-// USDCUSDTResponse is the JSON response structure
-type USDCUSDTResponse struct {
-	Timestamp string         `json:"timestamp"`
-	Count     int            `json:"count"`
-	Symbols   []USDCUSDTPair `json:"symbols"`
-}
-
-// Cache holds the cached symbol data with thread-safe access
-type Cache struct {
-	mu         sync.RWMutex
-	pairs      []USDCUSDTPair
-	lastUpdate time.Time
-}
-
-var (
-	cache = &Cache{}
-)
-
-// fetchSymbols retrieves all tradable symbols for a given market category
-func fetchSymbols(ctx context.Context, category string) ([]Instrument, error) {
-	var allSymbols []Instrument
-	cursor := ""
-	client := &http.Client{
-		Timeout: requestTimeout,
-	}
-
-	for {
-		url := fmt.Sprintf("%s?category=%s&limit=1000", bybitAPIEndpoint, category)
-		if cursor != "" {
-			url = fmt.Sprintf("%s&cursor=%s", url, cursor)
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("creating request: %w", err)
-		}
-
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("fetching symbols: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("API returned status %s", resp.Status)
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("reading response body: %w", err)
-		}
-
-		var apiResponse struct {
-			RetCode int    `json:"retCode"`
-			RetMsg  string `json:"retMsg"`
-			Result  struct {
-				List           []Instrument `json:"list"`
-				NextPageCursor string       `json:"nextPageCursor"`
-			} `json:"result"`
-		}
-
-		if err := json.Unmarshal(body, &apiResponse); err != nil {
-			return nil, fmt.Errorf("decoding JSON: %w", err)
-		}
-
-		if apiResponse.RetCode != 0 {
-			return nil, fmt.Errorf("API error: %s", apiResponse.RetMsg)
-		}
-
-		allSymbols = append(allSymbols, apiResponse.Result.List...)
-
-		if apiResponse.Result.NextPageCursor == "" {
-			break
-		}
-		cursor = apiResponse.Result.NextPageCursor
-	}
-
-	return allSymbols, nil
-}
-
-// findUSDCUSDTPairs finds symbols that have both USDC and USDT versions
-func findUSDCUSDTPairs() ([]USDCUSDTPair, error) {
-	ctx := context.Background()
-
-	// Fetch all linear symbols
-	futuresSymbols, err := fetchSymbols(ctx, "linear")
-	if err != nil {
-		return nil, fmt.Errorf("fetching futures symbols: %w", err)
-	}
-
-	// Group symbols by base coin (remove currency suffix)
-	symbolGroups := make(map[string][]Instrument)
-	for _, symbol := range futuresSymbols {
-		baseSymbol := symbol.Symbol
-
-		if len(baseSymbol) > 4 {
-			if baseSymbol[len(baseSymbol)-4:] == "USDT" {
-				baseSymbol = baseSymbol[:len(baseSymbol)-4]
-			} else if baseSymbol[len(baseSymbol)-4:] == "PERP" {
-				baseSymbol = baseSymbol[:len(baseSymbol)-4]
-			}
-		}
-
-		symbolGroups[baseSymbol] = append(symbolGroups[baseSymbol], symbol)
-	}
-
-	var pairs []USDCUSDTPair
-
-	// Find base coins that have both USDC and USDT versions
-	for baseSymbol, symbols := range symbolGroups {
-		var usdcSymbol, usdtSymbol Instrument
-		hasUSDC, hasUSDT := false, false
-
-		for _, symbol := range symbols {
-			switch symbol.SettleCoin {
-			case "USDC":
-				usdcSymbol = symbol
-				hasUSDC = true
-			case "USDT":
-				usdtSymbol = symbol
-				hasUSDT = true
-			}
-		}
-
-		if hasUSDC && hasUSDT {
-			pair := USDCUSDTPair{
-				BaseSymbol: baseSymbol,
-				USDC: struct {
-					Symbol      string `json:"symbol"`
-					DisplayName string `json:"displayName"`
-					MinOrderQty string `json:"minOrderQty"`
-				}{
-					Symbol:      usdcSymbol.Symbol,
-					DisplayName: usdcSymbol.DisplayName,
-					MinOrderQty: usdcSymbol.LotSizeFilter.MinOrderQty,
-				},
-				USDT: struct {
-					Symbol      string `json:"symbol"`
-					DisplayName string `json:"displayName"`
-					MinOrderQty string `json:"minOrderQty"`
-				}{
-					Symbol: usdtSymbol.Symbol,
-					DisplayName: func() string {
-						if usdtSymbol.DisplayName != "" {
-							return usdtSymbol.DisplayName
-						}
-						// Fallback to symbol name if displayName is empty
-						return usdtSymbol.Symbol
-					}(),
-					MinOrderQty: usdtSymbol.LotSizeFilter.MinOrderQty,
-				},
-			}
-			pairs = append(pairs, pair)
-		}
-	}
-
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].BaseSymbol < pairs[j].BaseSymbol
-	})
-
-	return pairs, nil
-}
-
-// updateCache updates the cache with fresh symbol data
-func updateCache() error {
-	pairs, err := findUSDCUSDTPairs()
-	if err != nil {
-		return fmt.Errorf("finding USDC/USDT pairs: %w", err)
-	}
-
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
-	cache.pairs = pairs
-	cache.lastUpdate = time.Now()
-
-	return nil
-}
-
-// cacheUpdateWorker updates the cache periodically
-func cacheUpdateWorker(ctx context.Context) {
-	if err := updateCache(); err != nil {
-		fmt.Printf("Initial cache update failed: %v\n", err)
-	}
-
-	ticker := time.NewTicker(updateInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := updateCache(); err != nil {
-				fmt.Printf("Cache update failed: %v\n", err)
-			}
-		}
-	}
-}
-
-// handleUSDCUSDT handles HTTP requests for USDC/USDT symbol pairs
-func handleUSDCUSDT(w http.ResponseWriter, r *http.Request) {
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-
-	if cache.lastUpdate.IsZero() {
-		http.Error(w, "Data not available yet", http.StatusServiceUnavailable)
-		return
-	}
-
-	response := USDCUSDTResponse{
-		Timestamp: cache.lastUpdate.Format(time.RFC3339),
-		Count:     len(cache.pairs),
-		Symbols:   cache.pairs,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// main entry point for the application
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	log.Println("starting symbol-resolver")
 
-	go cacheUpdateWorker(ctx)
+	// shared HTTP client with connection pooling
+	httpClient := client.NewHTTPClient()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/symbols/bybit-usdc-usdt", handleUSDCUSDT)
-
-	server := &http.Server{
-		Addr:         ":" + serverPort,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+	// exchange clients
+	clients := []client.ExchangeClient{
+		client.NewBinanceClient(httpClient),
+		client.NewBybitClient(httpClient),
+		client.NewMexcClient(httpClient),
 	}
 
+	// in-memory cache
+	cache := server.NewCache()
+
+	// --- startup sync (blocking, must succeed before serving) ---
+	log.Println("performing initial symbol sync...")
+
+	intersection, err := fetchWithRetry(clients, retryBackoff)
+	if err != nil {
+		log.Fatalf("initial sync failed after all retries: %v", err)
+	}
+
+	cache.Set(intersection)
+	log.Printf("initial sync complete: %d overlapping symbols", intersection.TotalSymbols)
+
+	// --- background refresh goroutine ---
 	go func() {
-		fmt.Printf("Server listening on port %s\n", serverPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("Server error: %v\n", err)
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			log.Println("background refresh: starting symbol sync...")
+
+			result, err := fetchOnce(clients)
+			if err != nil {
+				log.Printf("background refresh failed: %v — retrying in %s", err, retryInterval)
+
+				// retry once after retryInterval, do not wipe cache
+				time.Sleep(retryInterval)
+
+				result, err = fetchOnce(clients)
+				if err != nil {
+					log.Printf("background refresh retry failed: %v — keeping previous cache", err)
+					continue
+				}
+			}
+
+			cache.Set(result)
+			log.Printf("background refresh complete: %d overlapping symbols", result.TotalSymbols)
 		}
 	}()
 
+	// --- HTTP server ---
+	srv := &http.Server{
+		Addr:         httpAddr,
+		Handler:      server.NewServer(cache),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	// graceful shutdown listener
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
 
-	fmt.Println("Shutting down server...")
-	server.Shutdown(ctx)
+	go func() {
+		log.Printf("HTTP server listening on %s", httpAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// block until shutdown signal received
+	<-quit
+	log.Println("shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("graceful shutdown failed: %v", err)
+	}
+
+	log.Println("symbol-resolver stopped")
+}
+
+// fetchWithRetry attempts to fetch symbol data from all exchanges,
+// retrying with exponential backoff on failure
+func fetchWithRetry(clients []client.ExchangeClient, backoff []time.Duration) (*model.SymbolIntersection, error) {
+	var lastErr error
+
+	for attempt, wait := range backoff {
+		result, err := fetchOnce(clients)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		log.Printf("sync attempt %d failed: %v — retrying in %s", attempt+1, err, wait)
+		time.Sleep(wait)
+	}
+
+	// final attempt after last backoff
+	result, err := fetchOnce(clients)
+	if err != nil {
+		return nil, errors.Join(lastErr, err)
+	}
+
+	return result, nil
+}
+
+// fetchOnce concurrently fetches symbols from all exchanges and
+// computes the intersection. Fails fast if any exchange returns an error.
+func fetchOnce(clients []client.ExchangeClient) (*model.SymbolIntersection, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+
+	type result struct {
+		name    string
+		symbols map[model.CanonicalSymbol]string
+		err     error
+	}
+
+	results := make(chan result, len(clients))
+
+	for _, c := range clients {
+		c := c // capture loop variable
+		go func() {
+			symbols, err := c.FetchActiveUSDTSymbols(ctx)
+			results <- result{name: c.Name(), symbols: symbols, err: err}
+		}()
+	}
+
+	symbolsByExchange := make(map[string]map[model.CanonicalSymbol]string)
+
+	for range clients {
+		r := <-results
+		if r.err != nil {
+			return nil, r.err
+		}
+		symbolsByExchange[r.name] = r.symbols
+		log.Printf("fetched %d symbols from %s", len(r.symbols), r.name)
+	}
+
+	return resolver.Compute(
+		symbolsByExchange["binance"],
+		symbolsByExchange["bybit"],
+		symbolsByExchange["mexc"],
+	), nil
 }
