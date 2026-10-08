@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -45,6 +46,9 @@ func Compute(
 			RawMexc:    rawMexc,
 		})
 	}
+	sort.Slice(symbols, func(i, j int) bool {
+		return symbols[i].Canonical < symbols[j].Canonical
+	})
 
 	return &model.SymbolIntersection{
 		UpdatedAt:      time.Now().UTC(),

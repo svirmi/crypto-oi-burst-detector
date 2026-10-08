@@ -19,7 +19,7 @@ type SymbolMapping struct {
 // contracts across all three exchanges at a given point in time
 type SymbolIntersection struct {
 	UpdatedAt      time.Time       `json:"updated_at"`
-	TotalSymbols   int             `json:"total_symbols"`
+	TotalSymbols   int             `json:"total_overlapping"`
 	ExchangeCounts map[string]int  `json:"exchange_counts"`
 	Symbols        []SymbolMapping `json:"symbols"`
 }
