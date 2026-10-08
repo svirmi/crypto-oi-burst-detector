@@ -15,6 +15,7 @@ const mexcContractDetailURL = "https://contract.mexc.com/api/v1/contract/detail"
 // mexcContract represents a single contract entry in MEXC Futures response
 type mexcContract struct {
 	Symbol    string `json:"symbol"`
+	BaseCoin  string `json:"baseCoin"`
 	QuoteCoin string `json:"quoteCoin"`
 	State     int    `json:"state"`
 }
@@ -76,12 +77,25 @@ func (m *MexcClient) FetchActiveUSDTSymbols(ctx context.Context) (map[model.Cano
 		if c.State != 0 {
 			continue
 		}
-		if c.QuoteCoin != "USDT" {
+		quoteValue := strings.TrimSpace(c.QuoteCoin)
+		if quoteValue == "" {
+			return nil, fmt.Errorf("mexc: missing quote coin for %q", c.Symbol)
+		}
+		quote := strings.ToUpper(quoteValue)
+		if quote != "USDT" {
 			continue
 		}
 
-		canonical := model.CanonicalSymbol(strings.Replace(c.Symbol, "_", "-", 1))
-		symbols[canonical] = c.Symbol
+		base := strings.ToUpper(strings.TrimSpace(c.BaseCoin))
+		raw := c.Symbol
+		if base == "" || raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(base, "- \t\r\n") {
+			return nil, fmt.Errorf("mexc: invalid symbol metadata for %q", c.Symbol)
+		}
+		canonical := model.CanonicalSymbol(base + "-" + quote)
+		if existing, ok := symbols[canonical]; ok {
+			return nil, fmt.Errorf("mexc: duplicate canonical symbol %q from %q and %q", canonical, existing, raw)
+		}
+		symbols[canonical] = raw
 	}
 
 	return symbols, nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"symbol-resolver/internal/model"
 )
@@ -89,15 +90,28 @@ func (b *BybitClient) FetchActiveUSDTSymbols(ctx context.Context) (map[model.Can
 			if s.Status != "Trading" {
 				continue
 			}
-			if s.QuoteCoin != "USDT" {
+			quoteValue := strings.TrimSpace(s.QuoteCoin)
+			if quoteValue == "" {
+				return nil, fmt.Errorf("bybit: missing quote coin for %q", s.Symbol)
+			}
+			if !strings.EqualFold(quoteValue, "USDT") {
 				continue
 			}
 			if s.ContractType != "LinearPerpetual" {
 				continue
 			}
 
-			canonical := model.CanonicalSymbol(s.BaseCoin + "-" + s.QuoteCoin)
-			symbols[canonical] = s.Symbol
+			base := strings.ToUpper(strings.TrimSpace(s.BaseCoin))
+			quote := strings.ToUpper(quoteValue)
+			raw := s.Symbol
+			if base == "" || quote != "USDT" || raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(base, "- \t\r\n") {
+				return nil, fmt.Errorf("bybit: invalid symbol metadata for %q", s.Symbol)
+			}
+			canonical := model.CanonicalSymbol(base + "-" + quote)
+			if existing, ok := symbols[canonical]; ok {
+				return nil, fmt.Errorf("bybit: duplicate canonical symbol %q from %q and %q", canonical, existing, raw)
+			}
+			symbols[canonical] = raw
 		}
 
 		// no more pages
