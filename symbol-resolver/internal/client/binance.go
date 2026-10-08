@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"symbol-resolver/internal/model"
 )
@@ -69,15 +70,28 @@ func (b *BinanceClient) FetchActiveUSDTSymbols(ctx context.Context) (map[model.C
 		if s.Status != "TRADING" {
 			continue
 		}
-		if s.QuoteAsset != "USDT" {
+		quoteValue := strings.TrimSpace(s.QuoteAsset)
+		if quoteValue == "" {
+			return nil, fmt.Errorf("binance: missing quote asset for %q", s.Symbol)
+		}
+		if !strings.EqualFold(quoteValue, "USDT") {
 			continue
 		}
 		if s.ContractType != "PERPETUAL" {
 			continue
 		}
 
-		canonical := model.CanonicalSymbol(s.BaseAsset + "-" + s.QuoteAsset)
-		symbols[canonical] = s.Symbol
+		base := strings.ToUpper(strings.TrimSpace(s.BaseAsset))
+		quote := strings.ToUpper(quoteValue)
+		raw := s.Symbol
+		if base == "" || quote != "USDT" || raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(base, "- \t\r\n") {
+			return nil, fmt.Errorf("binance: invalid symbol metadata for %q", s.Symbol)
+		}
+		canonical := model.CanonicalSymbol(base + "-" + quote)
+		if existing, ok := symbols[canonical]; ok {
+			return nil, fmt.Errorf("binance: duplicate canonical symbol %q from %q and %q", canonical, existing, raw)
+		}
+		symbols[canonical] = raw
 	}
 
 	return symbols, nil
